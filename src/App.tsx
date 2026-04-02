@@ -47,10 +47,16 @@ interface TimetableEntry {
 
 // --- Helpers ---
 
+interface ActiveTime {
+  start: string // "HH:MM"
+  end: string   // "HH:MM"
+}
+
 const STORAGE_KEYS = {
   SLOTS: 'timetable-slots',
   MEMOS: 'timetable-memos',
   ENTRIES: 'timetable-entries',
+  ACTIVE_TIME: 'timetable-active-time',
 }
 
 const MEMO_COLORS = [
@@ -86,6 +92,11 @@ function saveToStorage<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value))
 }
 
+const DEFAULT_ACTIVE_TIME: ActiveTime = {
+  start: '06:00',
+  end: '22:00',
+}
+
 const DEFAULT_SLOTS: TimeSlot[] = [
   { id: generateId(), startTime: '06:00', endTime: '07:00', label: '朝活' },
   { id: generateId(), startTime: '07:00', endTime: '08:00', label: '朝食' },
@@ -98,6 +109,20 @@ const DEFAULT_SLOTS: TimeSlot[] = [
   { id: generateId(), startTime: '19:00', endTime: '21:00', label: '自由時間' },
   { id: generateId(), startTime: '21:00', endTime: '22:00', label: '就寝準備' },
 ]
+
+function timeToMinutes(time: string): number {
+  const [h, m] = time.split(':').map(Number)
+  return h * 60 + m
+}
+
+function isSlotInActiveRange(slot: TimeSlot, activeTime: ActiveTime): boolean {
+  const slotStart = timeToMinutes(slot.startTime)
+  const slotEnd = timeToMinutes(slot.endTime)
+  const activeStart = timeToMinutes(activeTime.start)
+  const activeEnd = timeToMinutes(activeTime.end)
+  // Show slot if it overlaps with the active range at all
+  return slotStart < activeEnd && slotEnd > activeStart
+}
 
 // --- Components ---
 
@@ -244,16 +269,24 @@ function App() {
   const [entries, setEntries] = useState<TimetableEntry[]>(() =>
     loadFromStorage(STORAGE_KEYS.ENTRIES, [])
   )
+  const [activeTime, setActiveTime] = useState<ActiveTime>(() =>
+    loadFromStorage(STORAGE_KEYS.ACTIVE_TIME, DEFAULT_ACTIVE_TIME)
+  )
 
   const [newMemoText, setNewMemoText] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [editSlots, setEditSlots] = useState<TimeSlot[]>([])
+  const [editActiveTime, setEditActiveTime] = useState<ActiveTime>(DEFAULT_ACTIVE_TIME)
   const memoInputRef = useRef<HTMLInputElement>(null)
+
+  // Filtered slots based on active time
+  const visibleSlots = slots.filter((slot) => isSlotInActiveRange(slot, activeTime))
 
   // Persist state
   useEffect(() => saveToStorage(STORAGE_KEYS.SLOTS, slots), [slots])
   useEffect(() => saveToStorage(STORAGE_KEYS.MEMOS, memos), [memos])
   useEffect(() => saveToStorage(STORAGE_KEYS.ENTRIES, entries), [entries])
+  useEffect(() => saveToStorage(STORAGE_KEYS.ACTIVE_TIME, activeTime), [activeTime])
 
   // Add memo
   const addMemo = useCallback(() => {
@@ -354,6 +387,7 @@ function App() {
   // Slot settings
   const openSettings = () => {
     setEditSlots(slots.map((s) => ({ ...s })))
+    setEditActiveTime({ ...activeTime })
     setSettingsOpen(true)
   }
 
@@ -362,6 +396,7 @@ function App() {
       (s) => s.startTime && s.endTime && s.label.trim()
     )
     setSlots(validSlots)
+    setActiveTime(editActiveTime)
     // Clean up entries for removed slots
     const validIds = new Set(validSlots.map((s) => s.id))
     setEntries((prev) => prev.filter((e) => validIds.has(e.slotId)))
@@ -487,7 +522,9 @@ function App() {
             <CalendarClock className="h-6 w-6 text-indigo-500" />
             <div>
               <h1 className="text-xl font-bold text-zinc-800">タイムテーブル</h1>
-              <p className="text-xs text-zinc-400">左のメモをドラッグ＆ドロップで配置</p>
+              <p className="text-xs text-zinc-400">
+                アクティブタイム: {activeTime.start} 〜 {activeTime.end} | 左のメモをドラッグ&ドロップで配置
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -537,7 +574,7 @@ function App() {
                 </div>
 
                 {/* Table Rows */}
-                {slots.map((slot) => (
+                {visibleSlots.map((slot) => (
                   <TimeSlotRow
                     key={slot.id}
                     slot={slot}
@@ -547,17 +584,21 @@ function App() {
                   />
                 ))}
 
-                {slots.length === 0 && (
+                {visibleSlots.length === 0 && (
                   <div className="p-12 text-center text-zinc-400">
                     <Clock className="h-10 w-10 mx-auto mb-3 opacity-30" />
-                    <p className="text-sm">時間帯が設定されていません</p>
+                    <p className="text-sm">
+                      {slots.length === 0
+                        ? '時間帯が設定されていません'
+                        : 'アクティブタイム内に時間帯がありません'}
+                    </p>
                     <Button
                       variant="outline"
                       size="sm"
                       className="mt-3"
                       onClick={openSettings}
                     >
-                      時間帯を設定する
+                      {slots.length === 0 ? '時間帯を設定する' : 'アクティブタイムを変更する'}
                     </Button>
                   </div>
                 )}
@@ -576,6 +617,35 @@ function App() {
               タイムテーブル設定
             </DialogTitle>
           </DialogHeader>
+
+          <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4 mb-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Clock className="h-4 w-4 text-indigo-500" />
+              <span className="text-sm font-semibold text-indigo-700">アクティブタイム</span>
+              <span className="text-xs text-indigo-400">表示する時間範囲</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <Label className="sr-only">開始</Label>
+              <Input
+                type="time"
+                value={editActiveTime.start}
+                onChange={(e) =>
+                  setEditActiveTime((prev) => ({ ...prev, start: e.target.value }))
+                }
+                className="w-36 text-sm bg-white"
+              />
+              <span className="text-indigo-400 font-medium">〜</span>
+              <Label className="sr-only">終了</Label>
+              <Input
+                type="time"
+                value={editActiveTime.end}
+                onChange={(e) =>
+                  setEditActiveTime((prev) => ({ ...prev, end: e.target.value }))
+                }
+                className="w-36 text-sm bg-white"
+              />
+            </div>
+          </div>
 
           <ScrollArea className="flex-1 -mx-6 px-6">
             <div className="space-y-3 py-2">
