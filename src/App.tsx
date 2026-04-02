@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, type DragEvent } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent } from 'react'
 import './App.css'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -16,47 +16,25 @@ import {
 import { Label } from '@/components/ui/label'
 import {
   Plus,
-  Trash2,
   GripVertical,
   Clock,
   StickyNote,
   Settings,
   X,
   CalendarClock,
+  Timer,
+  Info,
 } from 'lucide-react'
 
-// --- Types ---
+// --- Constants ---
 
-interface TimeSlot {
-  id: string
-  startTime: string // "HH:MM"
-  endTime: string   // "HH:MM"
-  label: string
-}
-
-interface MemoItem {
-  id: string
-  text: string
-  color: string
-}
-
-interface TimetableEntry {
-  slotId: string
-  memos: MemoItem[]
-}
-
-// --- Helpers ---
-
-interface ActiveTime {
-  start: string // "HH:MM"
-  end: string   // "HH:MM"
-}
+const TASK_SWITCH_BUFFER_MIN = 15
 
 const STORAGE_KEYS = {
-  SLOTS: 'timetable-slots',
-  MEMOS: 'timetable-memos',
-  ENTRIES: 'timetable-entries',
+  MEMOS: 'timetable-memos-v2',
+  ENTRIES: 'timetable-entries-v2',
   ACTIVE_TIME: 'timetable-active-time',
+  DEFAULT_TASK_DURATION: 'timetable-default-task-duration',
 }
 
 const MEMO_COLORS = [
@@ -69,6 +47,47 @@ const MEMO_COLORS = [
   'bg-teal-100 border-teal-300 text-teal-800',
   'bg-red-100 border-red-300 text-red-800',
 ]
+
+const DURATION_OPTIONS = [
+  { value: 15, label: '15\u5206' },
+  { value: 30, label: '30\u5206' },
+  { value: 45, label: '45\u5206' },
+  { value: 60, label: '1\u6642\u9593' },
+  { value: 90, label: '1.5\u6642\u9593' },
+  { value: 120, label: '2\u6642\u9593' },
+]
+
+// --- Types ---
+
+interface MemoItem {
+  id: string
+  text: string
+  color: string
+  durationMin: number
+}
+
+interface ActiveTime {
+  start: string
+  end: string
+}
+
+interface TimeSlot {
+  id: string
+  startTime: string
+  endTime: string
+}
+
+interface TimetableEntry {
+  slotId: string
+  memos: MemoItem[]
+}
+
+const DEFAULT_ACTIVE_TIME: ActiveTime = {
+  start: '09:00',
+  end: '21:00',
+}
+
+// --- Helpers ---
 
 function generateId(): string {
   return crypto.randomUUID()
@@ -83,7 +102,7 @@ function loadFromStorage<T>(key: string, fallback: T): T {
     const stored = localStorage.getItem(key)
     if (stored) return JSON.parse(stored) as T
   } catch {
-    // ignore parse errors
+    // ignore
   }
   return fallback
 }
@@ -92,36 +111,64 @@ function saveToStorage<T>(key: string, value: T): void {
   localStorage.setItem(key, JSON.stringify(value))
 }
 
-const DEFAULT_ACTIVE_TIME: ActiveTime = {
-  start: '06:00',
-  end: '22:00',
-}
-
-const DEFAULT_SLOTS: TimeSlot[] = [
-  { id: generateId(), startTime: '06:00', endTime: '07:00', label: '朝活' },
-  { id: generateId(), startTime: '07:00', endTime: '08:00', label: '朝食' },
-  { id: generateId(), startTime: '08:00', endTime: '09:00', label: '通勤' },
-  { id: generateId(), startTime: '09:00', endTime: '12:00', label: '午前' },
-  { id: generateId(), startTime: '12:00', endTime: '13:00', label: '昼食' },
-  { id: generateId(), startTime: '13:00', endTime: '17:00', label: '午後' },
-  { id: generateId(), startTime: '17:00', endTime: '18:00', label: '退勤' },
-  { id: generateId(), startTime: '18:00', endTime: '19:00', label: '夕食' },
-  { id: generateId(), startTime: '19:00', endTime: '21:00', label: '自由時間' },
-  { id: generateId(), startTime: '21:00', endTime: '22:00', label: '就寝準備' },
-]
-
 function timeToMinutes(time: string): number {
   const [h, m] = time.split(':').map(Number)
   return h * 60 + m
 }
 
-function isSlotInActiveRange(slot: TimeSlot, activeTime: ActiveTime): boolean {
-  const slotStart = timeToMinutes(slot.startTime)
-  const slotEnd = timeToMinutes(slot.endTime)
-  const activeStart = timeToMinutes(activeTime.start)
-  const activeEnd = timeToMinutes(activeTime.end)
-  // Show slot if it overlaps with the active range at all
-  return slotStart < activeEnd && slotEnd > activeStart
+function minutesToTime(minutes: number): string {
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+function generateSlots(activeTime: ActiveTime): TimeSlot[] {
+  const startMin = timeToMinutes(activeTime.start)
+  const endMin = timeToMinutes(activeTime.end)
+  if (endMin <= startMin) return []
+  const slots: TimeSlot[] = []
+  for (let t = startMin; t < endMin; t += 60) {
+    const slotEnd = Math.min(t + 60, endMin)
+    const startStr = minutesToTime(t)
+    const endStr = minutesToTime(slotEnd)
+    slots.push({
+      id: `slot-${startStr}`,
+      startTime: startStr,
+      endTime: endStr,
+    })
+  }
+  return slots
+}
+
+function getSlotDurationMin(slot: TimeSlot): number {
+  return timeToMinutes(slot.endTime) - timeToMinutes(slot.startTime)
+}
+
+function getUsedTimeInSlot(slotMemos: MemoItem[]): number {
+  if (slotMemos.length === 0) return 0
+  return slotMemos.reduce(
+    (sum, m) => sum + m.durationMin + TASK_SWITCH_BUFFER_MIN,
+    0
+  )
+}
+
+function getRemainingTimeInSlot(slot: TimeSlot, slotMemos: MemoItem[]): number {
+  return Math.max(0, getSlotDurationMin(slot) - getUsedTimeInSlot(slotMemos))
+}
+
+function getTaskCapacity(remainingMin: number, taskDuration: number): number {
+  const perTask = taskDuration + TASK_SWITCH_BUFFER_MIN
+  if (perTask <= 0) return 0
+  return Math.floor(remainingMin / perTask)
+}
+
+function formatDuration(minutes: number): string {
+  if (minutes >= 60) {
+    const h = Math.floor(minutes / 60)
+    const m = minutes % 60
+    return m > 0 ? `${h}\u6642\u9593${m}\u5206` : `${h}\u6642\u9593`
+  }
+  return `${minutes}\u5206`
 }
 
 // --- Components ---
@@ -154,6 +201,9 @@ function MemoCard({
     >
       {isDraggable && <GripVertical className="h-3.5 w-3.5 opacity-50 shrink-0" />}
       <span className="flex-1 truncate">{memo.text}</span>
+      <Badge variant="secondary" className="text-xs shrink-0">
+        {formatDuration(memo.durationMin)}
+      </Badge>
       {onRemove && (
         <button
           onClick={(e) => {
@@ -174,13 +224,23 @@ function TimeSlotRow({
   entries,
   onDrop,
   onRemoveMemo,
+  defaultTaskDuration,
 }: {
   slot: TimeSlot
   entries: MemoItem[]
   onDrop: (slotId: string, memo: MemoItem, source: string, sourceSlotId?: string) => void
   onRemoveMemo: (slotId: string, memoId: string) => void
+  defaultTaskDuration: number
 }) {
   const [isDragOver, setIsDragOver] = useState(false)
+
+  const slotDuration = getSlotDurationMin(slot)
+  const usedTime = getUsedTimeInSlot(entries)
+  const remaining = getRemainingTimeInSlot(slot, entries)
+  const capacity = getTaskCapacity(remaining, defaultTaskDuration)
+  const usagePercent = slotDuration > 0 ? Math.min(100, (usedTime / slotDuration) * 100) : 0
+
+  const barColor = usagePercent >= 90 ? 'bg-red-400' : usagePercent >= 60 ? 'bg-yellow-400' : 'bg-emerald-400'
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault()
@@ -210,48 +270,65 @@ function TimeSlotRow({
 
   return (
     <div
-      className={`flex border-b border-zinc-200 transition-colors ${
-        isDragOver ? 'bg-blue-50/70 ring-2 ring-blue-300 ring-inset' : 'hover:bg-zinc-50/50'
-      }`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
+      className={`border-b border-zinc-100 transition-colors ${isDragOver ? 'bg-indigo-50' : ''}`}
     >
-      {/* Time column */}
-      <div className="w-28 shrink-0 border-r border-zinc-200 p-3 flex flex-col items-center justify-center bg-zinc-50/80">
-        <span className="text-xs font-mono text-zinc-500">
-          {slot.startTime}
-        </span>
-        <span className="text-xs text-zinc-300">|</span>
-        <span className="text-xs font-mono text-zinc-500">
-          {slot.endTime}
-        </span>
-      </div>
+      <div className="flex items-stretch">
+        <div className="w-24 shrink-0 border-r border-zinc-100 p-3 flex flex-col justify-center">
+          <div className="text-sm font-semibold text-zinc-700">
+            {slot.startTime}
+          </div>
+          <div className="text-xs text-zinc-400">
+            {slot.endTime}
+          </div>
+        </div>
 
-      {/* Label column */}
-      <div className="w-24 shrink-0 border-r border-zinc-200 p-3 flex items-center justify-center">
-        <span className="text-sm font-semibold text-zinc-700">{slot.label}</span>
-      </div>
-
-      {/* Entries column */}
-      <div className="flex-1 p-3 min-h-16">
-        {entries.length > 0 ? (
-          <div className="flex flex-wrap gap-2">
-            {entries.map((memo) => (
-              <MemoCard
-                key={memo.id}
-                memo={memo}
-                isDraggable={true}
-                sourceSlotId={slot.id}
-                onRemove={() => onRemoveMemo(slot.id, memo.id)}
+        <div className="flex-1 p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <div className="flex-1 h-2 bg-zinc-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${barColor}`}
+                style={{ width: `${usagePercent}%` }}
               />
-            ))}
+            </div>
+            <div className="flex items-center gap-2 shrink-0 text-xs">
+              {remaining > 0 ? (
+                <>
+                  <span className="text-zinc-500">
+                    {'\u6B8B\u308A'} {formatDuration(remaining)}
+                  </span>
+                  <Badge variant="outline" className="text-xs font-normal">
+                    +{capacity}{'\u4EF6\u53EF'}
+                  </Badge>
+                </>
+              ) : (
+                <Badge variant="secondary" className="text-xs text-red-600 bg-red-50">
+                  {'\u6E80\u676F'}
+                </Badge>
+              )}
+            </div>
           </div>
-        ) : (
-          <div className="flex items-center justify-center h-full text-zinc-300 text-sm">
-            {isDragOver ? 'ここにドロップ' : 'メモをドラッグして追加'}
-          </div>
-        )}
+
+          {entries.length > 0 ? (
+            <div className="space-y-1.5">
+              {entries.map((memo) => (
+                <MemoCard
+                  key={memo.id}
+                  memo={memo}
+                  isDraggable
+                  sourceSlotId={slot.id}
+                  onRemove={() => onRemoveMemo(slot.id, memo.id)}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="text-xs text-zinc-300 py-2 text-center">
+              {'\u30C9\u30E9\u30C3\u30B0\uFF06\u30C9\u30ED\u30C3\u30D7\u3067\u30E1\u30E2\u3092\u914D\u7F6E'}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -260,9 +337,6 @@ function TimeSlotRow({
 // --- Main App ---
 
 function App() {
-  const [slots, setSlots] = useState<TimeSlot[]>(() =>
-    loadFromStorage(STORAGE_KEYS.SLOTS, DEFAULT_SLOTS)
-  )
   const [memos, setMemos] = useState<MemoItem[]>(() =>
     loadFromStorage(STORAGE_KEYS.MEMOS, [])
   )
@@ -272,23 +346,53 @@ function App() {
   const [activeTime, setActiveTime] = useState<ActiveTime>(() =>
     loadFromStorage(STORAGE_KEYS.ACTIVE_TIME, DEFAULT_ACTIVE_TIME)
   )
-
+  const [defaultTaskDuration, setDefaultTaskDuration] = useState<number>(() =>
+    loadFromStorage(STORAGE_KEYS.DEFAULT_TASK_DURATION, 30)
+  )
   const [newMemoText, setNewMemoText] = useState('')
+  const [newMemoDuration, setNewMemoDuration] = useState(30)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [editSlots, setEditSlots] = useState<TimeSlot[]>([])
-  const [editActiveTime, setEditActiveTime] = useState<ActiveTime>(DEFAULT_ACTIVE_TIME)
-  const memoInputRef = useRef<HTMLInputElement>(null)
+  const [editActiveTime, setEditActiveTime] = useState<ActiveTime>(activeTime)
+  const [editDefaultDuration, setEditDefaultDuration] = useState(defaultTaskDuration)
+  const inputRef = useRef<HTMLInputElement>(null)
 
-  // Filtered slots based on active time
-  const visibleSlots = slots.filter((slot) => isSlotInActiveRange(slot, activeTime))
+  const slots = useMemo(() => generateSlots(activeTime), [activeTime])
 
-  // Persist state
-  useEffect(() => saveToStorage(STORAGE_KEYS.SLOTS, slots), [slots])
-  useEffect(() => saveToStorage(STORAGE_KEYS.MEMOS, memos), [memos])
-  useEffect(() => saveToStorage(STORAGE_KEYS.ENTRIES, entries), [entries])
-  useEffect(() => saveToStorage(STORAGE_KEYS.ACTIVE_TIME, activeTime), [activeTime])
+  const summary = useMemo(() => {
+    let totalRemaining = 0
+    let totalCapacity = 0
+    for (const slot of slots) {
+      const slotMemos = entries.find((e) => e.slotId === slot.id)?.memos ?? []
+      const rem = getRemainingTimeInSlot(slot, slotMemos)
+      totalRemaining += rem
+      totalCapacity += getTaskCapacity(rem, defaultTaskDuration)
+    }
+    return { totalRemaining, totalCapacity }
+  }, [slots, entries, defaultTaskDuration])
 
-  // Add memo
+  useEffect(() => {
+    saveToStorage(STORAGE_KEYS.MEMOS, memos)
+  }, [memos])
+
+  useEffect(() => {
+    saveToStorage(STORAGE_KEYS.ENTRIES, entries)
+  }, [entries])
+
+  useEffect(() => {
+    saveToStorage(STORAGE_KEYS.ACTIVE_TIME, activeTime)
+  }, [activeTime])
+
+  useEffect(() => {
+    saveToStorage(STORAGE_KEYS.DEFAULT_TASK_DURATION, defaultTaskDuration)
+  }, [defaultTaskDuration])
+
+  const getEntriesForSlot = useCallback(
+    (slotId: string): MemoItem[] => {
+      return entries.find((e) => e.slotId === slotId)?.memos ?? []
+    },
+    [entries]
+  )
+
   const addMemo = useCallback(() => {
     const text = newMemoText.trim()
     if (!text) return
@@ -296,309 +400,245 @@ function App() {
       id: generateId(),
       text,
       color: getRandomColor(),
+      durationMin: newMemoDuration,
     }
     setMemos((prev) => [...prev, memo])
     setNewMemoText('')
-    memoInputRef.current?.focus()
-  }, [newMemoText])
+    inputRef.current?.focus()
+  }, [newMemoText, newMemoDuration])
 
-  // Remove memo from list
-  const removeMemoFromList = useCallback((memoId: string) => {
-    setMemos((prev) => prev.filter((m) => m.id !== memoId))
+  const removeMemo = useCallback((id: string) => {
+    setMemos((prev) => prev.filter((m) => m.id !== id))
   }, [])
 
-  // Remove memo from timetable slot
-  const removeMemoFromSlot = useCallback((slotId: string, memoId: string) => {
-    setEntries((prev) =>
-      prev
-        .map((entry) =>
-          entry.slotId === slotId
-            ? { ...entry, memos: entry.memos.filter((m) => m.id !== memoId) }
-            : entry
-        )
-        .filter((entry) => entry.memos.length > 0)
-    )
-  }, [])
-
-  // Drop memo onto a time slot
   const handleDrop = useCallback(
     (slotId: string, memo: MemoItem, source: string, sourceSlotId?: string) => {
-      // If dragging from the same slot, ignore
-      if (source === 'timetable' && sourceSlotId === slotId) return
-
-      // Remove from source
       if (source === 'memolist') {
         setMemos((prev) => prev.filter((m) => m.id !== memo.id))
       } else if (source === 'timetable' && sourceSlotId) {
         setEntries((prev) =>
-          prev
-            .map((entry) =>
-              entry.slotId === sourceSlotId
-                ? { ...entry, memos: entry.memos.filter((m) => m.id !== memo.id) }
-                : entry
-            )
-            .filter((entry) => entry.memos.length > 0)
+          prev.map((e) =>
+            e.slotId === sourceSlotId
+              ? { ...e, memos: e.memos.filter((m) => m.id !== memo.id) }
+              : e
+          )
         )
       }
 
-      // Add to target slot
       setEntries((prev) => {
         const existing = prev.find((e) => e.slotId === slotId)
         if (existing) {
-          return prev.map((entry) =>
-            entry.slotId === slotId
-              ? { ...entry, memos: [...entry.memos, { ...memo, id: generateId() }] }
-              : entry
+          if (existing.memos.some((m) => m.id === memo.id)) return prev
+          return prev.map((e) =>
+            e.slotId === slotId ? { ...e, memos: [...e.memos, memo] } : e
           )
         }
-        return [...prev, { slotId, memos: [{ ...memo, id: generateId() }] }]
+        return [...prev, { slotId, memos: [memo] }]
       })
     },
     []
   )
 
-  // Return memo from timetable back to memo list (when dropping on memo area)
-  const handleReturnToMemoList = useCallback((e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault()
-    try {
-      const memoData = e.dataTransfer.getData('memo')
-      const source = e.dataTransfer.getData('source')
-      const sourceSlotId = e.dataTransfer.getData('sourceSlotId')
-      if (memoData && source === 'timetable' && sourceSlotId) {
-        const memo = JSON.parse(memoData) as MemoItem
-        // Remove from timetable
-        setEntries((prev) =>
-          prev
-            .map((entry) =>
-              entry.slotId === sourceSlotId
-                ? { ...entry, memos: entry.memos.filter((m) => m.id !== memo.id) }
-                : entry
-            )
-            .filter((entry) => entry.memos.length > 0)
-        )
-        // Add back to memo list
-        setMemos((prev) => [...prev, { ...memo, id: generateId() }])
-      }
-    } catch {
-      // ignore
+  const removeMemoFromSlot = useCallback((slotId: string, memoId: string) => {
+    let removedMemo: MemoItem | undefined
+    setEntries((prev) =>
+      prev.map((e) => {
+        if (e.slotId === slotId) {
+          removedMemo = e.memos.find((m) => m.id === memoId)
+          return { ...e, memos: e.memos.filter((m) => m.id !== memoId) }
+        }
+        return e
+      })
+    )
+    if (removedMemo) {
+      const memoToReturn = removedMemo
+      setMemos((prev) => [...prev, memoToReturn])
     }
   }, [])
 
-  // Slot settings
+  const handleMemoListDrop = useCallback(
+    (e: DragEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      try {
+        const memoData = e.dataTransfer.getData('memo')
+        const source = e.dataTransfer.getData('source')
+        const sourceSlotId = e.dataTransfer.getData('sourceSlotId')
+        if (memoData && source === 'timetable' && sourceSlotId) {
+          const memo = JSON.parse(memoData) as MemoItem
+          setEntries((prev) =>
+            prev.map((ent) =>
+              ent.slotId === sourceSlotId
+                ? { ...ent, memos: ent.memos.filter((m) => m.id !== memo.id) }
+                : ent
+            )
+          )
+          setMemos((prev) => [...prev, memo])
+        }
+      } catch {
+        // ignore
+      }
+    },
+    []
+  )
+
   const openSettings = () => {
-    setEditSlots(slots.map((s) => ({ ...s })))
-    setEditActiveTime({ ...activeTime })
+    setEditActiveTime(activeTime)
+    setEditDefaultDuration(defaultTaskDuration)
     setSettingsOpen(true)
   }
 
   const saveSettings = () => {
-    const validSlots = editSlots.filter(
-      (s) => s.startTime && s.endTime && s.label.trim()
-    )
-    setSlots(validSlots)
     setActiveTime(editActiveTime)
-    // Clean up entries for removed slots
-    const validIds = new Set(validSlots.map((s) => s.id))
-    setEntries((prev) => prev.filter((e) => validIds.has(e.slotId)))
+    setDefaultTaskDuration(editDefaultDuration)
     setSettingsOpen(false)
   }
 
-  const addEditSlot = () => {
-    setEditSlots((prev) => [
-      ...prev,
-      { id: generateId(), startTime: '', endTime: '', label: '' },
-    ])
-  }
-
-  const removeEditSlot = (id: string) => {
-    setEditSlots((prev) => prev.filter((s) => s.id !== id))
-  }
-
-  const updateEditSlot = (id: string, field: keyof TimeSlot, value: string) => {
-    setEditSlots((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, [field]: value } : s))
-    )
-  }
-
-  // Clear all memos
-  const clearAllMemos = () => {
-    setMemos([])
-  }
-
-  // Clear all entries
-  const clearAllEntries = () => {
-    setEntries([])
-  }
-
-  const getEntriesForSlot = (slotId: string): MemoItem[] => {
-    return entries.find((e) => e.slotId === slotId)?.memos ?? []
-  }
-
   return (
-    <div className="flex h-screen bg-zinc-100">
-      {/* Left Sidebar: Memo List */}
+    <div className="flex h-screen bg-zinc-50">
       <div
-        className="w-80 shrink-0 border-r border-zinc-200 bg-white flex flex-col shadow-sm"
+        className="w-80 border-r border-zinc-200 bg-white flex flex-col shrink-0"
         onDragOver={(e) => {
           e.preventDefault()
           e.dataTransfer.dropEffect = 'move'
         }}
-        onDrop={handleReturnToMemoList}
+        onDrop={handleMemoListDrop}
       >
-        {/* Sidebar Header */}
-        <div className="p-4 border-b border-zinc-200 bg-gradient-to-r from-indigo-500 to-purple-500">
-          <div className="flex items-center gap-2 text-white mb-3">
-            <StickyNote className="h-5 w-5" />
-            <h2 className="text-lg font-bold">メモリスト</h2>
-            <Badge variant="secondary" className="ml-auto bg-white/20 text-white border-0">
-              {memos.length}
+        <div className="p-4 border-b border-zinc-100">
+          <div className="flex items-center gap-2 mb-3">
+            <StickyNote className="h-5 w-5 text-amber-500" />
+            <h2 className="font-bold text-zinc-800">{'\u30E1\u30E2\u30EA\u30B9\u30C8'}</h2>
+            <Badge variant="secondary" className="ml-auto text-xs">
+              {memos.length}{'\u4EF6'}
             </Badge>
           </div>
-          <div className="flex gap-2">
+
+          <div className="flex gap-2 mb-2">
             <Input
-              ref={memoInputRef}
+              ref={inputRef}
               value={newMemoText}
               onChange={(e) => setNewMemoText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') addMemo()
-              }}
-              placeholder="新しいメモを入力..."
-              className="bg-white/90 border-0 placeholder:text-zinc-400 text-sm"
+              onKeyDown={(e) => e.key === 'Enter' && addMemo()}
+              placeholder={'\u65B0\u3057\u3044\u30E1\u30E2...'}
+              className="text-sm"
             />
-            <Button
-              onClick={addMemo}
-              size="icon"
-              variant="secondary"
-              className="shrink-0 bg-white/20 hover:bg-white/30 text-white border-0"
-            >
+            <Button size="icon" onClick={addMemo} className="shrink-0">
               <Plus className="h-4 w-4" />
             </Button>
           </div>
+
+          <div className="flex items-center gap-2">
+            <Timer className="h-3.5 w-3.5 text-zinc-400" />
+            <select
+              value={newMemoDuration}
+              onChange={(e) => setNewMemoDuration(Number(e.target.value))}
+              className="flex-1 text-xs border border-zinc-200 rounded-md px-2 py-1.5 bg-white text-zinc-700"
+            >
+              {DURATION_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
-        {/* Memo Items */}
-        <ScrollArea className="flex-1">
-          <div className="p-3 space-y-2">
-            {memos.length === 0 ? (
-              <div className="text-center py-12 text-zinc-400">
-                <StickyNote className="h-10 w-10 mx-auto mb-3 opacity-30" />
-                <p className="text-sm">メモがありません</p>
-                <p className="text-xs mt-1">上のフィールドからメモを追加してください</p>
-              </div>
-            ) : (
-              memos.map((memo) => (
+        <ScrollArea className="flex-1 p-3">
+          {memos.length > 0 ? (
+            <div className="space-y-2">
+              {memos.map((memo) => (
                 <MemoCard
                   key={memo.id}
                   memo={memo}
-                  isDraggable={true}
-                  onRemove={() => removeMemoFromList(memo.id)}
+                  isDraggable
+                  onRemove={() => removeMemo(memo.id)}
                 />
-              ))
-            )}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-12 text-zinc-300">
+              <StickyNote className="h-10 w-10 mb-3 opacity-40" />
+              <p className="text-sm">{'\u30E1\u30E2\u304C\u3042\u308A\u307E\u305B\u3093'}</p>
+              <p className="text-xs mt-1">{'\u4E0A\u306E\u30D5\u30A9\u30FC\u30E0\u304B\u3089\u8FFD\u52A0\u3057\u3066\u304F\u3060\u3055\u3044'}</p>
+            </div>
+          )}
         </ScrollArea>
-
-        {/* Sidebar Footer */}
-        {memos.length > 0 && (
-          <div className="p-3 border-t border-zinc-200">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={clearAllMemos}
-              className="w-full text-zinc-400 hover:text-red-500 text-xs"
-            >
-              <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-              メモをすべてクリア
-            </Button>
-          </div>
-        )}
       </div>
 
-      {/* Main: Timetable */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Header */}
-        <div className="p-4 bg-white border-b border-zinc-200 shadow-sm flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <CalendarClock className="h-6 w-6 text-indigo-500" />
-            <div>
-              <h1 className="text-xl font-bold text-zinc-800">タイムテーブル</h1>
-              <p className="text-xs text-zinc-400">
-                アクティブタイム: {activeTime.start} 〜 {activeTime.end} | 左のメモをドラッグ&ドロップで配置
-              </p>
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="bg-white border-b border-zinc-200 px-6 py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <CalendarClock className="h-6 w-6 text-indigo-500" />
+              <div>
+                <h1 className="text-lg font-bold text-zinc-800">{'\u30BF\u30A4\u30E0\u30C6\u30FC\u30D6\u30EB'}</h1>
+                <p className="text-xs text-zinc-400">
+                  {activeTime.start} {'\u301C'} {activeTime.end}
+                </p>
+              </div>
             </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={clearAllEntries}
-              className="text-xs text-zinc-500"
-            >
-              <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-              テーブルをクリア
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={openSettings}
-              className="text-xs"
-            >
-              <Settings className="h-3.5 w-3.5 mr-1.5" />
-              時間帯を設定
-            </Button>
+
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2 text-sm">
+                <Clock className="h-4 w-4 text-zinc-400" />
+                <span className="text-zinc-600">
+                  {'\u6B8B\u308A\u5408\u8A08'}: <span className="font-semibold text-indigo-600">{formatDuration(summary.totalRemaining)}</span>
+                </span>
+              </div>
+              <Separator orientation="vertical" className="h-6" />
+              <div className="flex items-center gap-2 text-sm">
+                <Info className="h-4 w-4 text-zinc-400" />
+                <span className="text-zinc-600">
+                  {'\u8FFD\u52A0\u53EF\u80FD'}: <span className="font-semibold text-emerald-600">{summary.totalCapacity}{'\u4EF6'}</span>
+                </span>
+              </div>
+              <Separator orientation="vertical" className="h-6" />
+              <div className="flex items-center gap-2 text-sm text-zinc-400">
+                <Timer className="h-4 w-4" />
+                <span>{'\u5207\u66FF'}{TASK_SWITCH_BUFFER_MIN}{'\u5206'}</span>
+              </div>
+              <Button variant="outline" size="sm" onClick={openSettings}>
+                <Settings className="h-4 w-4 mr-1.5" />
+                {'\u8A2D\u5B9A'}
+              </Button>
+            </div>
           </div>
         </div>
 
-        {/* Timetable */}
         <ScrollArea className="flex-1">
-          <div className="p-4">
-            <Card className="overflow-hidden">
+          <div className="p-6">
+            <Card className="shadow-sm">
               <CardContent className="p-0">
-                {/* Table Header */}
-                <div className="flex border-b border-zinc-300 bg-zinc-100">
-                  <div className="w-28 shrink-0 border-r border-zinc-300 p-2 text-center">
-                    <span className="text-xs font-semibold text-zinc-500 flex items-center justify-center gap-1">
-                      <Clock className="h-3.5 w-3.5" />
-                      時間
-                    </span>
+                <div className="flex items-center bg-zinc-50 border-b border-zinc-200 px-3 py-2">
+                  <div className="w-24 shrink-0 text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                    {'\u6642\u9593'}
                   </div>
-                  <div className="w-24 shrink-0 border-r border-zinc-300 p-2 text-center">
-                    <span className="text-xs font-semibold text-zinc-500">ラベル</span>
-                  </div>
-                  <div className="flex-1 p-2 text-center">
-                    <span className="text-xs font-semibold text-zinc-500 flex items-center justify-center gap-1">
-                      <StickyNote className="h-3.5 w-3.5" />
-                      メモ
-                    </span>
+                  <div className="flex-1 text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+                    {'\u30BF\u30B9\u30AF'}
                   </div>
                 </div>
 
-                {/* Table Rows */}
-                {visibleSlots.map((slot) => (
+                {slots.map((slot) => (
                   <TimeSlotRow
                     key={slot.id}
                     slot={slot}
                     entries={getEntriesForSlot(slot.id)}
                     onDrop={handleDrop}
                     onRemoveMemo={removeMemoFromSlot}
+                    defaultTaskDuration={defaultTaskDuration}
                   />
                 ))}
 
-                {visibleSlots.length === 0 && (
+                {slots.length === 0 && (
                   <div className="p-12 text-center text-zinc-400">
                     <Clock className="h-10 w-10 mx-auto mb-3 opacity-30" />
-                    <p className="text-sm">
-                      {slots.length === 0
-                        ? '時間帯が設定されていません'
-                        : 'アクティブタイム内に時間帯がありません'}
-                    </p>
+                    <p className="text-sm">{'\u30A2\u30AF\u30C6\u30A3\u30D6\u30BF\u30A4\u30E0\u3092\u8A2D\u5B9A\u3057\u3066\u304F\u3060\u3055\u3044'}</p>
                     <Button
                       variant="outline"
                       size="sm"
                       className="mt-3"
                       onClick={openSettings}
                     >
-                      {slots.length === 0 ? '時間帯を設定する' : 'アクティブタイムを変更する'}
+                      {'\u8A2D\u5B9A\u3092\u958B\u304F'}
                     </Button>
                   </div>
                 )}
@@ -608,111 +648,80 @@ function App() {
         </ScrollArea>
       </div>
 
-      {/* Settings Dialog */}
       <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
-        <DialogContent className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
+        <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Settings className="h-5 w-5" />
-              タイムテーブル設定
+              {'\u8A2D\u5B9A'}
             </DialogTitle>
           </DialogHeader>
 
-          <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4 mb-4">
-            <div className="flex items-center gap-2 mb-3">
-              <Clock className="h-4 w-4 text-indigo-500" />
-              <span className="text-sm font-semibold text-indigo-700">アクティブタイム</span>
-              <span className="text-xs text-indigo-400">表示する時間範囲</span>
+          <div className="space-y-6 py-2">
+            <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <Clock className="h-4 w-4 text-indigo-500" />
+                <span className="text-sm font-semibold text-indigo-700">{'\u30A2\u30AF\u30C6\u30A3\u30D6\u30BF\u30A4\u30E0'}</span>
+              </div>
+              <p className="text-xs text-indigo-400 mb-3">{'\u8868\u793A\u3059\u308B\u6642\u9593\u7BC4\u56F2\uFF081\u6642\u9593\u5358\u4F4D\u3067\u81EA\u52D5\u5206\u5272\uFF09'}</p>
+              <div className="flex items-center gap-3">
+                <Label className="sr-only">{'\u958B\u59CB'}</Label>
+                <Input
+                  type="time"
+                  value={editActiveTime.start}
+                  onChange={(e) =>
+                    setEditActiveTime((prev) => ({ ...prev, start: e.target.value }))
+                  }
+                  className="w-36 text-sm bg-white"
+                />
+                <span className="text-indigo-400 font-medium">{'\u301C'}</span>
+                <Label className="sr-only">{'\u7D42\u4E86'}</Label>
+                <Input
+                  type="time"
+                  value={editActiveTime.end}
+                  onChange={(e) =>
+                    setEditActiveTime((prev) => ({ ...prev, end: e.target.value }))
+                  }
+                  className="w-36 text-sm bg-white"
+                />
+              </div>
             </div>
-            <div className="flex items-center gap-3">
-              <Label className="sr-only">開始</Label>
-              <Input
-                type="time"
-                value={editActiveTime.start}
-                onChange={(e) =>
-                  setEditActiveTime((prev) => ({ ...prev, start: e.target.value }))
-                }
-                className="w-36 text-sm bg-white"
-              />
-              <span className="text-indigo-400 font-medium">〜</span>
-              <Label className="sr-only">終了</Label>
-              <Input
-                type="time"
-                value={editActiveTime.end}
-                onChange={(e) =>
-                  setEditActiveTime((prev) => ({ ...prev, end: e.target.value }))
-                }
-                className="w-36 text-sm bg-white"
-              />
+
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4">
+              <div className="flex items-center gap-2 mb-3">
+                <Timer className="h-4 w-4 text-emerald-500" />
+                <span className="text-sm font-semibold text-emerald-700">{'\u30C7\u30D5\u30A9\u30EB\u30C8\u30BF\u30B9\u30AF\u6642\u9593'}</span>
+              </div>
+              <p className="text-xs text-emerald-400 mb-3">{'\u7A7A\u304D\u679A\u306E\u8FFD\u52A0\u53EF\u80FD\u4EF6\u6570\u306E\u8A08\u7B97\u306B\u4F7F\u7528'}</p>
+              <select
+                value={editDefaultDuration}
+                onChange={(e) => setEditDefaultDuration(Number(e.target.value))}
+                className="w-full text-sm border border-emerald-200 rounded-md px-3 py-2 bg-white text-zinc-700"
+              >
+                {DURATION_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="rounded-lg border border-zinc-200 bg-zinc-50 p-4">
+              <div className="flex items-center gap-2 mb-2">
+                <Info className="h-4 w-4 text-zinc-400" />
+                <span className="text-sm font-semibold text-zinc-600">{'\u5207\u308A\u66FF\u3048\u30D0\u30C3\u30D5\u30A1'}</span>
+              </div>
+              <p className="text-xs text-zinc-400">
+                {'\u5404\u30BF\u30B9\u30AF\u9593\u306B\u81EA\u52D5\u3067'}{TASK_SWITCH_BUFFER_MIN}{'\u5206\u306E\u5207\u308A\u66FF\u3048\u6642\u9593\u304C\u52A0\u7B97\u3055\u308C\u307E\u3059\u3002'}
+              </p>
             </div>
           </div>
 
-          <ScrollArea className="flex-1 -mx-6 px-6">
-            <div className="space-y-3 py-2">
-              {editSlots.map((slot, index) => (
-                <div key={slot.id} className="flex items-center gap-2">
-                  <span className="text-xs text-zinc-400 w-6 text-right shrink-0">
-                    {index + 1}
-                  </span>
-                  <div className="flex items-center gap-2 flex-1">
-                    <Label className="sr-only">開始時間</Label>
-                    <Input
-                      type="time"
-                      value={slot.startTime}
-                      onChange={(e) =>
-                        updateEditSlot(slot.id, 'startTime', e.target.value)
-                      }
-                      className="w-32 text-sm"
-                    />
-                    <span className="text-zinc-400 text-sm">〜</span>
-                    <Label className="sr-only">終了時間</Label>
-                    <Input
-                      type="time"
-                      value={slot.endTime}
-                      onChange={(e) =>
-                        updateEditSlot(slot.id, 'endTime', e.target.value)
-                      }
-                      className="w-32 text-sm"
-                    />
-                    <Label className="sr-only">ラベル</Label>
-                    <Input
-                      value={slot.label}
-                      onChange={(e) =>
-                        updateEditSlot(slot.id, 'label', e.target.value)
-                      }
-                      placeholder="ラベル"
-                      className="flex-1 text-sm"
-                    />
-                  </div>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => removeEditSlot(slot.id)}
-                    className="shrink-0 text-zinc-400 hover:text-red-500"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          </ScrollArea>
-
-          <Separator />
-
-          <DialogFooter className="flex items-center justify-between sm:justify-between">
-            <Button variant="outline" size="sm" onClick={addEditSlot}>
-              <Plus className="h-4 w-4 mr-1.5" />
-              時間帯を追加
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setSettingsOpen(false)}>
+              {'\u30AD\u30E3\u30F3\u30BB\u30EB'}
             </Button>
-            <div className="flex gap-2">
-              <Button
-                variant="ghost"
-                onClick={() => setSettingsOpen(false)}
-              >
-                キャンセル
-              </Button>
-              <Button onClick={saveSettings}>保存</Button>
-            </div>
+            <Button onClick={saveSettings}>{'\u4FDD\u5B58'}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
